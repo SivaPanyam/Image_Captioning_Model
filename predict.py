@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from configs.config import PROJECT_ROOT, IMAGE_SIZE
-from src.preprocessing.vocabulary import Vocabulary, START_IDX, END_IDX, PAD_IDX
+from src.preprocessing.vocabulary import Vocabulary, START_IDX, END_IDX, PAD_IDX, UNK_IDX
 from src.encoder.feature_extractor import get_image_transforms
 from models.captioning_model import ShowAndTellModel, AdaptiveAttentionModel
 
@@ -90,10 +90,13 @@ def beam_search_decode(
     beam_width: int = 3,
     max_length: int = 30,
     length_penalty_alpha: float = 0.7,
+    specificity_factor: float = 0.0,
+    repetition_penalty: float = 1.0,
+    min_length: int = 0,
     model_type: str = "baseline",
     device: torch.device = torch.device("cpu"),
 ) -> Tuple[str, List[str]]:
-    """Generates caption via Beam Search with length normalization."""
+    """Generates caption via Beam Search with length normalization and optional specificity boost."""
     with torch.no_grad():
         if model_type == "baseline":
             features = model.encoder(image_tensor)
@@ -108,7 +111,15 @@ def beam_search_decode(
         beams = [([START_IDX], 0.0, h, c)]
         completed_beams = []
 
-        for _ in range(max_length):
+        # Precompute frequency penalties if specificity_factor > 0
+        freq_penalty = None
+        if specificity_factor > 0:
+            freq_penalty = torch.zeros(len(vocab), device=device)
+            for word, idx in vocab.word2idx.items():
+                freq = vocab.word_freq.get(word, 1) if hasattr(vocab, "word_freq") and vocab.word_freq else 1
+                freq_penalty[idx] = specificity_factor * torch.log(torch.tensor(float(freq) + 1.0, device=device))
+
+        for step in range(max_length):
             candidates = []
             for tokens, score, cur_h, cur_c in beams:
                 last_token = torch.tensor([[tokens[-1]]], dtype=torch.long, device=device)
@@ -126,7 +137,22 @@ def beam_search_decode(
                     nxt_h, nxt_c = model.decoder.lstm_cell(cell_in, (cur_h, cur_c))
                     logits = model.decoder.fc(nxt_h)
 
+                # Repetition penalty
+                if repetition_penalty > 1.0:
+                    for prev_tok in set(tokens[1:]):
+                        logits[0, prev_tok] /= repetition_penalty
+
+                # Specificity penalty
+                if freq_penalty is not None:
+                    logits = logits - freq_penalty
+
+                # Min length penalty on END token
+                if step < min_length:
+                    logits[:, END_IDX] = -1e9
+
                 log_probs = F.log_softmax(logits, dim=-1)
+                # Suppress UNK token from being selected during generation
+                log_probs[:, UNK_IDX] = -1e9
                 topk_probs, topk_ids = log_probs.topk(beam_width)
 
                 for k in range(beam_width):
@@ -172,6 +198,9 @@ def main():
     parser.add_argument("--method", type=str, default="beam", choices=["greedy", "beam"], help="Decoding strategy")
     parser.add_argument("--beam-width", type=int, default=3, help="Beam width for beam search")
     parser.add_argument("--max-length", type=int, default=30, help="Maximum generated caption length")
+    parser.add_argument("--specificity-factor", type=float, default=0.0, help="Inverse-frequency unigram penalty factor")
+    parser.add_argument("--repetition-penalty", type=float, default=1.0, help="Repetition penalty discount (>1.0)")
+    parser.add_argument("--min-length", type=int, default=0, help="Minimum tokens before END is allowed")
     args = parser.parse_args()
 
     image_path = Path(args.image)
@@ -209,6 +238,9 @@ def main():
             vocab=vocab,
             beam_width=args.beam_width,
             max_length=args.max_length,
+            specificity_factor=args.specificity_factor,
+            repetition_penalty=args.repetition_penalty,
+            min_length=args.min_length,
             model_type=args.model,
             device=device,
         )
