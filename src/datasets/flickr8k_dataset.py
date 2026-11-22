@@ -48,6 +48,7 @@ class Flickr8kDataset(Dataset):
         images_dir: Path = IMAGES_DIR,
         captions_file: Path = CAPTIONS_FILE,
         max_length: int = MAX_CAPTION_LENGTH,
+        feature_cache_path: Optional[Path] = None,
     ):
         self.split = split.lower()
         assert self.split in ["train", "val", "test"], f"Invalid split: {split}"
@@ -55,6 +56,11 @@ class Flickr8kDataset(Dataset):
         self.images_dir = Path(images_dir)
         self.max_length = max_length
         self.tokenizer = SimpleTokenizer()
+        self.feature_cache_path = feature_cache_path
+        self.cached_features: Optional[Dict[str, torch.Tensor]] = None
+
+        if self.feature_cache_path is not None and Path(self.feature_cache_path).exists():
+            self.cached_features = torch.load(self.feature_cache_path, weights_only=False)
 
         # Resolve split file
         split_map = {
@@ -99,11 +105,14 @@ class Flickr8kDataset(Dataset):
     def __getitem__(self, idx: int):
         if self.split == "train":
             img_name, caption = self.samples[idx]
-            img_path = self.images_dir / img_name
 
-            # Load image lazily
-            image = Image.open(img_path).convert("RGB")
-            image_tensor = self.transform(image)
+            # Use in-memory cached features if available, else load image
+            if self.cached_features is not None and img_name in self.cached_features:
+                image_tensor = self.cached_features[img_name]
+            else:
+                img_path = self.images_dir / img_name
+                image = Image.open(img_path).convert("RGB")
+                image_tensor = self.transform(image)
 
             # Tokenize & Numericalize
             tokens = self.tokenizer.tokenize(caption)
@@ -115,10 +124,13 @@ class Flickr8kDataset(Dataset):
             return image_tensor, torch.tensor(input_ids, dtype=torch.long), torch.tensor(target_ids, dtype=torch.long)
         else:
             img_name = self.image_names[idx]
-            img_path = self.images_dir / img_name
 
-            image = Image.open(img_path).convert("RGB")
-            image_tensor = self.transform(image)
+            if self.cached_features is not None and img_name in self.cached_features:
+                image_tensor = self.cached_features[img_name]
+            else:
+                img_path = self.images_dir / img_name
+                image = Image.open(img_path).convert("RGB")
+                image_tensor = self.transform(image)
 
             # Keep raw reference tokens for BLEU/CIDEr multi-reference scoring
             raw_references = [
@@ -176,15 +188,16 @@ def get_dataloaders(
     batch_size: int = BATCH_SIZE,
     num_workers: int = 0,
     vocab: Optional[Vocabulary] = None,
+    feature_cache_path: Optional[Path] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Factory creating Train, Validation, and Test DataLoaders.
     """
     collate_fn = CaptionCollate(pad_idx=PAD_IDX)
 
-    train_dataset = Flickr8kDataset(split="train", vocab=vocab)
-    val_dataset = Flickr8kDataset(split="val", vocab=vocab)
-    test_dataset = Flickr8kDataset(split="test", vocab=vocab)
+    train_dataset = Flickr8kDataset(split="train", vocab=vocab, feature_cache_path=feature_cache_path)
+    val_dataset = Flickr8kDataset(split="val", vocab=vocab, feature_cache_path=feature_cache_path)
+    test_dataset = Flickr8kDataset(split="test", vocab=vocab, feature_cache_path=feature_cache_path)
 
     train_loader = DataLoader(
         train_dataset,

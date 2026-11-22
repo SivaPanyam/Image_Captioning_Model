@@ -169,8 +169,22 @@ def main():
     vocab_size = len(vocab)
     print(f"Loaded Vocabulary: {vocab_size} tokens")
 
-    # 2. Build DataLoaders
-    train_loader, val_loader, _ = get_dataloaders(batch_size=args.batch_size, vocab=vocab)
+    # 2. Build DataLoaders with cached features
+    cache_path = None
+    if args.model == "baseline":
+        global_cache = PROJECT_ROOT / "dataset" / "cached_features" / "resnet50_global.pt"
+        if global_cache.exists():
+            cache_path = global_cache
+            print(f"[*] Using high-speed cached global features: {global_cache}")
+    else:
+        spatial_cache = PROJECT_ROOT / "dataset" / "cached_features" / "resnet50_spatial.pt"
+        if spatial_cache.exists():
+            cache_path = spatial_cache
+            print(f"[*] Using high-speed cached spatial features: {spatial_cache}")
+
+    train_loader, val_loader, _ = get_dataloaders(
+        batch_size=args.batch_size, vocab=vocab, feature_cache_path=cache_path
+    )
     print(f"Loaded {len(train_loader.dataset)} training samples ({len(train_loader)} batches/epoch)")
 
     # 3. Instantiate Architecture

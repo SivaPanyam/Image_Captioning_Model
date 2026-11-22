@@ -14,7 +14,7 @@ from models.captioning_model import ShowAndTellModel, AdaptiveAttentionModel
 from src.evaluation.metrics import compute_corpus_bleu, compute_corpus_rouge_l
 
 
-def evaluate(checkpoint_path: Path, model_type: str = "baseline"):
+def evaluate(checkpoint_path: Path, model_type: str = "baseline", max_samples: int = 0):
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
@@ -29,9 +29,22 @@ def evaluate(checkpoint_path: Path, model_type: str = "baseline"):
     vocab_path = PROJECT_ROOT / "dataset" / "vocab.json"
     vocab = Vocabulary.load(vocab_path)
 
-    # 2. Load Test Dataset (1,091 images)
-    test_dataset = Flickr8kDataset(split="test", vocab=vocab)
-    print(f"Loaded Test Set: {len(test_dataset)} images")
+    # 2. Load Test Dataset with high-speed feature caching
+    cache_path = None
+    if model_type == "baseline":
+        g_cache = PROJECT_ROOT / "dataset" / "cached_features" / "resnet50_global.pt"
+        if g_cache.exists():
+            cache_path = g_cache
+    else:
+        s_cache = PROJECT_ROOT / "dataset" / "cached_features" / "resnet50_spatial.pt"
+        if s_cache.exists():
+            cache_path = s_cache
+
+    test_dataset = Flickr8kDataset(split="test", vocab=vocab, feature_cache_path=cache_path)
+    total_samples = len(test_dataset)
+    if max_samples > 0:
+        total_samples = min(total_samples, max_samples)
+    print(f"Loaded Test Set: {total_samples} images to evaluate (cached features: {cache_path is not None})")
 
     # 3. Load Checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -51,20 +64,29 @@ def evaluate(checkpoint_path: Path, model_type: str = "baseline"):
 
     print("Generating candidate captions across test split...")
     with torch.no_grad():
-        for i in range(len(test_dataset)):
-            image_tensor, raw_refs, img_name = test_dataset[i]
-            image_tensor = image_tensor.unsqueeze(0).to(device)
+        for i in range(total_samples):
+            item_tensor, raw_refs, img_name = test_dataset[i]
+            item_tensor = item_tensor.unsqueeze(0).to(device)
 
             # Generate token sequence
             if model_type == "baseline":
-                gen_ids = model.generate(image_tensor, max_length=25)[0].cpu().tolist()
+                if item_tensor.dim() == 2 or (item_tensor.dim() == 4 and item_tensor.size(1) != 3):
+                    # Pre-extracted global feature (1, 2048)
+                    feat = item_tensor
+                    gen_ids = model.decoder.generate_caption(feat, max_length=25)[0].cpu().tolist()
+                else:
+                    gen_ids = model.generate(item_tensor, max_length=25)[0].cpu().tolist()
             else:
                 # Attention model greedy decoding
                 gen_ids = []
-                # Fallback to decoder generation
-                features = model.encoder.forward_spatial(image_tensor)
-                b, c, h, w = features.shape
-                spatial_flat = features.view(b, c, h * w).permute(0, 2, 1)
+                if item_tensor.dim() == 4 and item_tensor.size(1) != 3:
+                    # Pre-extracted spatial feature (1, 2048, 7, 7) float16 -> float32
+                    b, c, h, w = item_tensor.shape
+                    spatial_flat = item_tensor.view(b, c, h * w).permute(0, 2, 1).to(torch.float32)
+                else:
+                    features = model.encoder.forward_spatial(item_tensor)
+                    b, c, h, w = features.shape
+                    spatial_flat = features.view(b, c, h * w).permute(0, 2, 1).to(torch.float32)
                 # Decode steps
                 curr = torch.tensor([[1]], dtype=torch.long, device=device) # <START>
                 h_s, c_s = model.decoder.init_hidden_state(spatial_flat)
@@ -106,6 +128,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate Image Captioning Model")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
     parser.add_argument("--model", type=str, default="baseline", choices=["baseline", "adaptive"])
+    parser.add_argument("--max-samples", type=int, default=0, help="Limit number of evaluation samples (0 for all)")
     args = parser.parse_args()
 
-    evaluate(args.checkpoint, args.model)
+    evaluate(args.checkpoint, args.model, max_samples=args.max_samples)

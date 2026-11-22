@@ -40,20 +40,25 @@ class ShowAndTellModel(nn.Module):
         )
 
     def forward(
-        self, images: torch.Tensor, captions: torch.Tensor
+        self, images_or_features: torch.Tensor, captions: torch.Tensor
     ) -> torch.Tensor:
         """
         Training forward pass with teacher forcing.
         
         Args:
-            images: Tensor of shape (B, 3, 224, 224)
+            images_or_features: Either raw image Tensor (B, 3, 224, 224) or pre-extracted features (B, 2048)
             captions: Tensor of token IDs (B, T)
             
         Returns:
             logits: Tensor of shape (B, T, vocab_size)
         """
-        # (B, 3, 224, 224) -> (B, 2048)
-        features = self.encoder(images)
+        if images_or_features.dim() == 4:
+            # (B, 3, 224, 224) -> (B, 2048)
+            features = self.encoder(images_or_features)
+        else:
+            # Pre-extracted (B, 2048)
+            features = images_or_features
+
         # (B, 2048) + (B, T) -> (B, T, vocab_size)
         logits = self.decoder(features, captions)
         return logits
@@ -105,23 +110,32 @@ class AdaptiveAttentionModel(nn.Module):
         )
 
     def forward(
-        self, images: torch.Tensor, captions: torch.Tensor
+        self, images_or_features: torch.Tensor, captions: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            images: Tensor of shape (B, 3, 224, 224)
+            images_or_features: Raw image Tensor (B, 3, 224, 224) or pre-extracted spatial maps (B, 2048, 7, 7) or (B, N, 2048)
             captions: Tensor of shape (B, T)
             
         Returns:
             logits: (B, T, vocab_size)
-            alphas: (B, T, 196) attention weights
+            alphas: (B, T, num_pixels) attention weights
         """
-        # (B, 3, 224, 224) -> (B, 2048, 14, 14)
-        spatial_maps = self.encoder.forward_spatial(images)
-
-        # Reshape to (B, 196, 2048) for sequence attention
-        batch_size, channels, h, w = spatial_maps.shape
-        spatial_features = spatial_maps.view(batch_size, channels, h * w).permute(0, 2, 1)
+        if images_or_features.dim() == 4:
+            if images_or_features.size(1) == 3:
+                # Raw images: (B, 3, 224, 224) -> (B, 2048, 14, 14)
+                spatial_maps = self.encoder.forward_spatial(images_or_features)
+                batch_size, channels, h, w = spatial_maps.shape
+                spatial_features = spatial_maps.view(batch_size, channels, h * w).permute(0, 2, 1)
+            else:
+                # Pre-extracted spatial maps: (B, 2048, 7, 7)
+                batch_size, channels, h, w = images_or_features.shape
+                spatial_features = images_or_features.view(batch_size, channels, h * w).permute(0, 2, 1)
+        elif images_or_features.dim() == 3:
+            # Already formatted: (B, N, 2048)
+            spatial_features = images_or_features
+        else:
+            raise ValueError(f"Unexpected spatial features shape: {images_or_features.shape}")
 
         logits, alphas = self.decoder(spatial_features, captions)
         return logits, alphas
