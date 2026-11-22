@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+
+.venv/
+venv/
+ENV/
+
+.vscode/
+.idea/
+
+.env
+
+# Large dataset files (do not commit raw gigabyte images to GitHub)
+dataset/Flickr8k/Images/
+dataset/Flickr8k/captions.txt
+
+outputs/
+checkpoints/
+*.pth
+*.pt
+*.bin
+*.onnx
+
+.ipynb_checkpoints/
