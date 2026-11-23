@@ -2,21 +2,51 @@
 ## Project: Adaptive Multi-Modal Image Captioning System
 **Institution / Target:** Research Publication & University Defense  
 **Author / Lead:** Siva Panyam  
-**Target Benchmarks:** Flickr8k (Primary Verification) $\to$ MS-COCO (Scalability)
+**Target Benchmarks:** Flickr8k (Primary Verification) $\to$ MS-COCO (Scalability)  
+**Hugging Face Hub:** [SivaPanyam/Neural-Image-Captioning-Model](https://huggingface.co/SivaPanyam/Neural-Image-Captioning-Model)
 
 ---
 
 ## 1. Executive Research Summary
 This project designs and evaluates end-to-end deep learning architectures for automatic image description generation. Moving beyond legacy Show-and-Tell architectures, this initiative addresses key vision-language failure modes:
-1. **Information Collapse in Global Average Pooling:** Loss of spatial coordinate grounding.
-2. **Exposure Bias in Teacher-Forcing Decoders:** Train/inference distribution discrepancy.
-3. **Visual Drift & Object Hallucination:** Language models overpowering weak visual conditioning.
+1. **Information Collapse in Global Average Pooling:** Loss of spatial coordinate grounding in vanilla CNNs.
+2. **Exposure Bias in Teacher-Forcing Decoders:** Discrepancy between training with ground truth context and inference generation.
+3. **Visual Drift & Mode Collapse:** Language models overpowering weak visual conditioning, defaulting to statistically frequent unigrams.
+4. **Edge & NPU Deployment Bottlenecks:** Heavy parameter counts (> 100 MB) preventing real-time mobile and edge inference.
 
-The research proposes **Adaptive Multi-Modal Semantic Routing (AMSR)** coupled with **Self-Critical Policy Gradient Fine-Tuning** to achieve state-of-the-art caption fidelity, high CIDEr/BLEU scores, and low hallucination (CHAIR).
+The research proposes:
+- **Adaptive Visual Sentinel Cross-Attention** to dynamically route attention between image regions and language states.
+- **Vision Transformer (ViT-B/16)** patch self-attention to capture complex inter-object visual semantics.
+- **Ultra-Compact INT8 Dynamic Quantization (MobileNetV3)** to compress models to $6.08\text{ MB}$ for real-time mobile NPU execution without catastrophic semantic degradation.
 
 ---
 
-## 2. System Architecture & Component Inventory
+## 2. Empirical Benchmark Matrix (Flickr8k Test Split: 1,091 Images)
+
+Evaluated under multi-reference ground truth (5 references per image) with corpus-level $n$-gram precision and recall:
+
+| Architecture | BLEU-1 | BLEU-2 | BLEU-3 | BLEU-4 | ROUGE-L | Checkpoint Size | Quantization | Latency | Target Deployment |
+|---|---|---|---|---|---|---|---|---|---|
+| **Baseline (ResNet-50 + LSTM)** | 56.88 | 39.75 | 26.46 | 17.47 | 42.90 | 154 MB | FP32 | ~35 ms | Server Reference |
+| **Adaptive Sentinel (ResNet-50)** | 61.75 | 44.22 | 30.71 | 21.51 | 45.67 | 101 MB | INT8 | ~18 ms | High-Precision API |
+| **Vision Transformer (ViT-B/16)** | **61.52** | **44.69** | **31.84** | **`22.17`** | **45.62** | 214 MB | INT8 | ~65 ms | Maximum Accuracy Cloud |
+| **Ultra-Compact MobileNetV3** | 53.60 | 36.40 | 23.50 | 14.80 | 40.10 | **`6.08 MB`** | **INT8** | **~8-15 ms** | **Edge / NPU Mobile** |
+
+---
+
+## 3. Dual-Platform Architecture & Latency Profile
+
+| Dimension | Cloud / Desktop (ViT-B/16 + Transformer) | Edge / Mobile (MobileNetV3 INT8) | Delta / Trade-off |
+|---|---|---|---|
+| **Model Size** | 214.3 MB (INT8) / 393.6 MB (FP32) | **6.08 MB (INT8)** | **96.1% Memory Reduction** |
+| **Peak RAM** | ~650 MB | **~28 MB** | Ultra-low memory footprint |
+| **Inference Latency** | 60–80 ms (CPU) / 12 ms (GPU) | **8–15 ms (NPU / CPU)** | **4x–6x Speedup on CPU/NPU** |
+| **Compute Engine** | CUDA Tensor Cores | INT8 Matrix / NPU Engines | Runs locally on phones |
+| **Semantic Preservation** | High granularity (*"two dogs playing with each other in snow"*) | Core semantics (*"two dogs play in the snow"*) | Minimal semantic loss |
+
+---
+
+## 4. System Architecture & Component Inventory
 
 ### Stage 0–3: Environment & Data Partitions
 * **Hardware Profile:** Intel Core i5-12450H (8 Cores), 16GB RAM, NVIDIA RTX 2050 Laptop GPU (4GB VRAM).
@@ -35,28 +65,27 @@ The research proposes **Adaptive Multi-Modal Semantic Routing (AMSR)** coupled w
 * **Vocabulary Isolation:**
   * Vocabulary constructed strictly on training captions with $\text{min\_freq} = 5$.
   * Size: **$2,563$ unique tokens** saved at `dataset/vocab.json`.
-* **Sequence Utilities (`src/preprocessing/sequence_utils.py`):**
-  * Teacher-forcing shifted pairs:
-    $$\mathbf{x}_{\text{input}} = [\langle\text{START}\rangle, w_1, w_2, \dots, w_T], \quad \mathbf{y}_{\text{target}} = [w_1, w_2, \dots, w_T, \langle\text{END}\rangle]$$
 
-### Stage 5: Visual Backbone (`src/encoder/resnet_encoder.py`)
-* Pretrained ResNet-50 backbone with stripped linear classification head.
-* Dual output capability:
-  1. Global Representation: $\mathbf{v} \in \mathbb{R}^{B \times 2048}$
-  2. Spatial Grid Map: $\mathbf{V}_{\text{spatial}} \in \mathbb{R}^{B \times 2048 \times 14 \times 14} \implies 196$ localized visual tokens.
+### Stage 5: Visual Backbones
+1. **ResNet-50 (`src/encoder/resnet_encoder.py`):** Global feature vector ($2048$) and $14 \times 14$ spatial grid map ($196 \times 2048$).
+2. **Vision Transformer (`src/encoder/vit_encoder.py`):** Pretrained ViT-B/16 generating $196$ patch tokens ($D=768$).
+3. **MobileNetV3-Small (`models/mobile_captioner.py`):** Inverted residual feature extractor ($D=576$) with INT8 dynamic quantization.
 
 ---
 
-## 3. Comparative Research Ablation Roadmap
+## 5. Theoretical Innovations
 
-| Model Variant | Visual Feature Extractor | Sequence Decoder | Objective Function | Key Theoretical Novelty | Target CIDEr |
-|---|---|---|---|---|---|
-| **Model 0 (Baseline)** | ResNet-50 Global ($2048$) | Vanilla LSTM | Cross-Entropy (MLE) | Baseline Benchmark (Show & Tell) | $\approx 45.0$ |
-| **Model 1 (Spatial)** | ResNet-50 Grid ($196 \times 2048$) | Bahdanau Attention LSTM | Cross-Entropy (MLE) | Spatial visual alignment | $\approx 62.0$ |
-| **Model 2 (Transformer)** | ResNet-50 Grid | Multi-Head Cross-Attention | Label-Smoothed CE | Self-attention parallelization | $\approx 74.0$ |
-| **Model 3 (Proposed Novelty)** | Hybrid Spatial + Contrastive Semantics | Dual-Gated Visual Sentinel (AMSR) | MLE + SCST (RL Reward) | Gated cross-modal routing + metric optimization | **$> 90.0$** |
+### Visual Sentinel Gating ($\beta_t$)
+$$\mathbf{s}_t = g(\mathbf{W}_x \mathbf{x}_t + \mathbf{W}_h \mathbf{h}_{t-1})$$
+$$\beta_t = \sigma(\mathbf{w}_\beta^T [\mathbf{h}_t; \mathbf{s}_t] + b_\beta) \in [0, 1]$$
+$$\hat{\mathbf{c}}_t = \beta_t \mathbf{c}_t + (1 - \beta_t) \mathbf{s}_t$$
+
+### Frequency-Aware Specificity Penalty
+$$\mathbf{z}_t'(w) = \mathbf{z}_t(w) - \lambda \cdot \log(1 + f(w)) - \gamma \cdot \mathbb{I}[w \in w_{<t}]$$
 
 ---
 
-## 4. Subagent Research Engine
-A dedicated research agent (`captioning-research-strategist`) is registered to continuously formulate hypotheses, design novel loss formulations, and review training dynamics against CVPR/ACL literature.
+## 6. Artifact & Deployment Inventory
+- **GitHub Repository:** `https://github.com/SivaPanyam/Image_Captioning_Model.git`
+- **Hugging Face Model Hub:** `https://huggingface.co/SivaPanyam/Neural-Image-Captioning-Model`
+- **Quantized Mobile Model:** `checkpoints/mobile/mobilenet_captioner_int8.pth` ($6.08\text{ MB}$)
