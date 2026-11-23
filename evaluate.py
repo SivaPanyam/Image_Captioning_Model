@@ -11,6 +11,7 @@ from configs.config import PROJECT_ROOT, BATCH_SIZE
 from src.preprocessing.vocabulary import Vocabulary
 from src.datasets.flickr8k_dataset import Flickr8kDataset
 from models.captioning_model import ShowAndTellModel, AdaptiveAttentionModel
+from src.decoder.vit_transformer_decoder import ViTTransformerCaptioningModel
 from src.evaluation.metrics import compute_corpus_bleu, compute_corpus_rouge_l
 
 
@@ -35,10 +36,14 @@ def evaluate(checkpoint_path: Path, model_type: str = "baseline", max_samples: i
         g_cache = PROJECT_ROOT / "dataset" / "cached_features" / "resnet50_global.pt"
         if g_cache.exists():
             cache_path = g_cache
-    else:
+    elif model_type == "adaptive":
         s_cache = PROJECT_ROOT / "dataset" / "cached_features" / "resnet50_spatial.pt"
         if s_cache.exists():
             cache_path = s_cache
+    elif model_type == "vit_transformer":
+        v_cache = PROJECT_ROOT / "dataset" / "cached_features" / "vit_b16_patches.pt"
+        if v_cache.exists():
+            cache_path = v_cache
 
     test_dataset = Flickr8kDataset(split="test", vocab=vocab, feature_cache_path=cache_path)
     total_samples = len(test_dataset)
@@ -52,8 +57,10 @@ def evaluate(checkpoint_path: Path, model_type: str = "baseline", max_samples: i
 
     if model_type == "baseline":
         model = ShowAndTellModel(vocab_size=vocab_size).to(device)
-    else:
+    elif model_type == "adaptive":
         model = AdaptiveAttentionModel(vocab_size=vocab_size).to(device)
+    else:
+        model = ViTTransformerCaptioningModel(vocab_size=vocab_size).to(device)
 
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
@@ -76,7 +83,7 @@ def evaluate(checkpoint_path: Path, model_type: str = "baseline", max_samples: i
                     gen_ids = model.decoder.generate_caption(feat, max_length=25)[0].cpu().tolist()
                 else:
                     gen_ids = model.generate(item_tensor, max_length=25)[0].cpu().tolist()
-            else:
+            elif model_type == "adaptive":
                 # Attention model greedy decoding
                 gen_ids = []
                 if item_tensor.dim() == 4 and item_tensor.size(1) != 3:
@@ -100,6 +107,38 @@ def evaluate(checkpoint_path: Path, model_type: str = "baseline", max_samples: i
                         break
                     gen_ids.append(next_id)
                     curr = torch.tensor([[next_id]], dtype=torch.long, device=device)
+            else:
+                # ViT-Transformer autoregressive greedy decoding
+                gen_ids = []
+                if item_tensor.dim() == 3:
+                    # Pre-extracted patches (1, 196, 768)
+                    patches = item_tensor.to(torch.float32)
+                else:
+                    patches, _ = model.encoder(item_tensor)
+                memory = model.visual_proj(patches)
+
+                generated = [1] # <START>
+                for step in range(25):
+                    tgt_in = torch.tensor([generated], dtype=torch.long, device=device)
+                    seq_len = tgt_in.size(1)
+                    tgt_mask = model.generate_square_subsequent_mask(seq_len, device)
+                    tgt_emb = model.embedding(tgt_in) * (model.d_model ** 0.5)
+                    tgt_emb = model.pos_encoder(tgt_emb)
+
+                    for layer in model.layers:
+                        tgt_emb = layer(tgt_emb, memory, tgt_mask=tgt_mask)
+                    tgt_emb = model.final_norm(tgt_emb)
+                    logits = model.fc_out(tgt_emb[:, -1])
+
+                    if step < 4:
+                        logits[0, 2] = -1e9 # Prevent early <END>
+                    logits[0, 3] = -1e9     # Suppress <UNK>
+
+                    nxt_id = logits.argmax(dim=-1).item()
+                    if nxt_id == 2: # <END>
+                        break
+                    generated.append(nxt_id)
+                    gen_ids.append(nxt_id)
 
             # Filter out special tokens
             cand_tokens = [
@@ -127,7 +166,7 @@ def evaluate(checkpoint_path: Path, model_type: str = "baseline", max_samples: i
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate Image Captioning Model")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--model", type=str, default="baseline", choices=["baseline", "adaptive"])
+    parser.add_argument("--model", type=str, default="baseline", choices=["baseline", "adaptive", "vit_transformer"])
     parser.add_argument("--max-samples", type=int, default=0, help="Limit number of evaluation samples (0 for all)")
     args = parser.parse_args()
 
